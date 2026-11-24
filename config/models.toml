@@ -1,0 +1,35 @@
+# multi-model-team 模型与调用配置
+# 模型名、档位、路径只在这里改。可用 MULTI_MODEL_TEAM_CONFIG 环境变量指向另一份配置。
+# 模型名均为 2026-11-24 实测可用（agy models / codex exec -m）。
+
+[paths]
+# codex / agy 的路径不存在时，会自动回退到 PATH 里找同名命令
+codex = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex"
+agy = "~/.local/bin/agy"
+# 未传 --run-dir 时，每次调用的记录目录建在这里
+runs_root = "~/.multi-model-team/runs"
+
+[agy_ask]
+# Gemini 的档位已经编码在模型名里（-low/-medium/-high/-xhigh）
+model = "gemini-4-neon-high"
+timeout = "15m"
+# agy 自带超时之外，再等这么久仍不结束就强制终止
+kill_grace = "60s"
+
+[codex_worker]
+model = "gpt-6.2-astra"
+effort = "xhigh"
+timeout = "60m"
+
+[codex_review]
+model = "gpt-6.2-sol"
+effort = "high"
+# 改动涉及下列关键词的文件时自动用深审档位
+deep_effort = "xhigh"
+max_rounds = 2
+timeout = "30m"
+deep_path_keywords = [
+  "pay", "billing", "price", "money", "refund", "invoice", "wallet",
+  "auth", "login", "session", "permission", "role", "acl", "token", "secret", "credential",
+  "webhook", "notify", "notification", "message", "email", "sms", "feishu", "lark",
+]

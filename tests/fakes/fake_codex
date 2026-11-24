@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+"""测试用的假 codex：记录参数和标准输入，按环境变量模拟 exec / resume / review。"""
+
+import json
+import os
+import subprocess
+import sys
+import time
+
+argv = sys.argv[1:]
+stdin = sys.stdin.read() if "-" in argv else ""
+with open(os.environ["FAKE_LOG"], "a", encoding="utf-8") as f:
+    f.write(json.dumps({"argv": argv, "cwd": os.getcwd(), "stdin": stdin}, ensure_ascii=False) + "\n")
+
+time.sleep(float(os.environ.get("FAKE_SLEEP", "0")))
+out_path = argv[argv.index("-o") + 1]
+
+if "--output-schema" in argv:  # codex-review 的调用
+    review = os.environ.get("FAKE_REVIEW_JSON", '{"summary": "没问题", "findings": []}')
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(review)
+    print(json.dumps({"type": "turn.completed", "usage": {}}))
+    sys.exit(0)
+
+if os.environ.get("FAKE_CODEX_WRITE"):
+    with open(os.environ["FAKE_CODEX_WRITE"], "w") as f:
+        f.write("new\n")
+if os.environ.get("FAKE_CODEX_COMMIT"):
+    subprocess.run(["git", "add", "-A"], check=True)
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "codex"], check=True)
+
+thread = argv[argv.index("-") - 1] if "resume" in argv else "th-1"
+events = [{"type": "thread.started", "thread_id": thread}, {"type": "turn.started"}]
+if os.environ.get("FAKE_CODEX_CMD"):
+    events.append(
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "command": os.environ["FAKE_CODEX_CMD"],
+                "exit_code": int(os.environ.get("FAKE_CODEX_CMD_EXIT", "0")),
+            },
+        }
+    )
+events.append({"type": "item.completed", "item": {"type": "agent_message", "text": "都做完了，测试通过"}})
+events.append({"type": "turn.completed", "usage": {"output_tokens": 5}})
+for e in events:
+    print(json.dumps(e, ensure_ascii=False))
+with open(out_path, "w", encoding="utf-8") as f:
+    f.write("都做完了，测试通过")

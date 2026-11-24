@@ -1,0 +1,12 @@
+# multi-model-team 本项目的推送前关卡配置（review-gate / guard-check 读取）
+
+[checks]
+commands = ["python3 -m unittest discover tests"]
+timeout = "10m"
+
+[[guards]]
+name = "no-personal-abs-path"
+pattern = '/Users/[A-Za-z0-9._-]+/'
+files = ["**"]
+exclude = [".multi-model-team/**"]
+message = "不要写死个人绝对路径（/Users/<用户名>/...）：用 ~、$HOME、相对仓库根目录的路径，或从 PATH 查找命令"

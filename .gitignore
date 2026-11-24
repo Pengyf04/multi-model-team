@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+# 私人实施记录，不公开（公开版见 docs/design.md）
+plan.md
+
+# 本机 Claude Code 设置
+.claude/settings.local.json
+
+# 测试覆盖率产物
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.ruff_cache/

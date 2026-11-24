@@ -1,0 +1,27 @@
+[project]
+name = "multi-model-team"
+version = "0.1.0"
+description = "让 Claude、Gemini、Codex 分工协作的 Claude Code skill 与命令行工具"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-include = ["bin/*", "tests/fakes/*"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+
+[tool.coverage.run]
+source = ["lib/multi_model_team"]
+branch = true
+parallel = true
+# 测试通过子进程运行 bin/ 下的命令，需要跟进子进程统计
+patch = ["subprocess"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+fail_under = 80
