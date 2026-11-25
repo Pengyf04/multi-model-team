@@ -102,7 +102,11 @@ def main(argv: list[str] | None = None) -> int:
 
     model = args.model or section["model"]
     effort = args.effort or section["effort"]
-    run_dir = c.make_run_dir(cfg, "codex-worker", args.run_dir, wt)
+    try:
+        run_dir = c.make_run_dir(cfg, "codex-worker", args.run_dir, wt)
+    except c.UsageError as e:
+        print(f"codex-worker：{e}")
+        return c.EXIT_USAGE
     prompt = (RESUME_NOTE + task) if args.resume else (c.prompt_text("codex-worker.md") + task)
     (run_dir / "prompt.md").write_text(prompt, encoding="utf-8")
 

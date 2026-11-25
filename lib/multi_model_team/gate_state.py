@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import datetime as _dt
+import hashlib
 import json
 import os
 import re
@@ -83,9 +84,12 @@ def find_pass(repo: Path, tree: str, push_base: str | None) -> dict | None:
 
 
 def _branch_file(repo: Path, branch: str) -> Path:
+    """branch 是推送目标键（远端地址 + 完整目标引用）。文件名带哈希，避免 release/api 与 release_api 撞名。"""
     d = state_dir(repo) / "rounds"
     d.mkdir(exist_ok=True)
-    return d / (re.sub(r"[^A-Za-z0-9._-]+", "_", branch) + ".json")
+    readable = re.sub(r"[^A-Za-z0-9._-]+", "_", branch)[-60:]
+    digest = hashlib.sha256(branch.encode("utf-8")).hexdigest()[:16]
+    return d / f"{readable}-{digest}.json"
 
 
 def load_rounds(repo: Path, branch: str) -> dict | None:
@@ -94,14 +98,27 @@ def load_rounds(repo: Path, branch: str) -> dict | None:
 
 
 def save_rounds(repo: Path, branch: str, data: dict) -> None:
-    c.write_json(_branch_file(repo, branch), data)
+    c.write_json(_branch_file(repo, branch), {**data, "target": branch})
 
 
 def clear_rounds(repo: Path, branch: str | None = None) -> int:
     d = state_dir(repo) / "rounds"
     if not d.exists():
         return 0
-    targets = [_branch_file(repo, branch)] if branch else list(d.glob("*.json"))
+    targets = list(d.glob("*.json"))
+    if branch:
+        exact = _branch_file(repo, branch)
+
+        def wanted(p: Path) -> bool:
+            if p == exact:
+                return True
+            try:
+                target = json.loads(p.read_text(encoding="utf-8")).get("target", "")
+            except (OSError, json.JSONDecodeError):
+                return False
+            return target == branch or target.endswith(f" refs/heads/{branch}")
+
+        targets = [p for p in targets if wanted(p)]
     n = 0
     for p in targets:
         if p.exists():

@@ -33,7 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
         sp = sub.add_parser(name, help=help_)
         sp.add_argument("repo", nargs="?", default=".")
         if name == "reset":
-            sp.add_argument("--branch", help="只清某个推送目标，如 origin:main（默认全部）")
+            sp.add_argument("--branch", help="只清推往某个远端分支（如 main）的轮数（默认全部）")
     hk = sub.add_parser("hook", help="由 git pre-push 钩子调用，不需要手动运行")
     hk.add_argument("remote_name", nargs="?", default="origin")
     hk.add_argument("remote_url", nargs="?", default="")
@@ -102,7 +102,8 @@ def status(repo: Path) -> int:
     ]
     rounds_dir = gate_state.state_dir(repo) / "rounds"
     for p in sorted(rounds_dir.glob("*.json")) if rounds_dir.exists() else []:
-        lines.append(f"被挡中的推送目标：{p.stem}，已审 {json.loads(p.read_text())['round']} 轮")
+        data = json.loads(p.read_text())
+        lines.append(f"被挡中的推送目标：{data.get('target', p.stem)}，已审 {data['round']} 轮")
     log = gate_state.state_dir(repo) / "gate.log"
     if log.exists():
         lines.append("最近记录：")
@@ -133,9 +134,17 @@ def is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
 
 def remote_heads(repo: Path, remote: str) -> list[str] | None:
     """向远程实际查询现有分支的提交；查不到（离线、无权限）返回 None。不用本地 refs/remotes，它可能已过期。"""
-    res = subprocess.run(
-        ["git", "ls-remote", "--heads", remote], cwd=repo, capture_output=True, text=True, stdin=subprocess.DEVNULL
-    )
+    try:
+        res = subprocess.run(
+            ["git", "ls-remote", "--heads", remote],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        return None
     if res.returncode != 0:
         return None
     return [line.split()[0] for line in res.stdout.splitlines() if line.strip()]
@@ -146,7 +155,8 @@ def push_base(repo: Path, remote: str, remote_sha: str, local_sha: str) -> str |
 
     以 git 传给钩子的远端旧提交为准：
     - 远端已有该分支且本次是快进：从远端旧提交审起；
-    - 非快进（强推回退、改写历史）或本地没有远端旧提交：基准无法确认，审整个仓库；
+    - 非快进（强推回退、改写历史）由 hook 先行拦下，交人决定，不会走到这里；
+    - 本地没有远端旧提交：基准无法确认，审整个仓库；
     - 远端新建分支：向远程查询现有分支，取与本次推送最近的公共祖先；查不到就审整个仓库。"""
     if not is_zero(remote_sha):
         if object_exists(repo, remote_sha) and is_ancestor(repo, remote_sha, local_sha):
@@ -304,13 +314,23 @@ def hook(args) -> int:
     else:
         print("[2/3] 守卫检查：未配置，跳过")
 
+    remote = args.remote_url or args.remote_name
     for _, local_sha, remote_ref, remote_sha in updates:
-        remote = args.remote_url or args.remote_name
+        if not is_zero(remote_sha) and not (
+            object_exists(repo, remote_sha) and is_ancestor(repo, remote_sha, local_sha)
+        ):
+            target = remote_ref.removeprefix("refs/heads/")
+            gate_state.log(repo, f"NON_FF {remote} {remote_ref}")
+            return fail(
+                f"推送到 {target} 不是快进（强推/改写历史，或本地没有远端最新提交）。"
+                "这类更新可能撤掉远端已有的修复，关卡无法判断，需要你来决定：\n"
+                f"  - 先 git fetch 并基于远端最新提交继续\n  - 确认要覆盖：{ALLOW_HINT}"
+            )
         base = push_base(repo, remote, remote_sha, local_sha)
         if base == local_sha:
             print("[3/3] Codex 审查：没有新提交，跳过")
             continue
-        code = review(repo, f"{args.remote_name}:{remote_ref.removeprefix('refs/heads/')}", base)
+        code = review(repo, f"{remote} {remote_ref}", base)
         if code != c.EXIT_OK:
             return code
     print("✓ 推送前关卡全部通过")

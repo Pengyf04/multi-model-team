@@ -7,7 +7,12 @@ import sys
 import time
 
 with open(os.environ["FAKE_LOG"], "a", encoding="utf-8") as f:
-    f.write(json.dumps({"argv": sys.argv[1:], "cwd": os.getcwd()}, ensure_ascii=False) + "\n")
+    record = {"argv": sys.argv[1:], "cwd": os.getcwd()}
+    if os.environ.get("FAKE_AGY_LIST"):  # 记录工作目录里能看到的全部文件
+        record["files"] = sorted(
+            os.path.relpath(os.path.join(d, n), os.getcwd()) for d, _, names in os.walk(os.getcwd()) for n in names
+        )
+    f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 time.sleep(float(os.environ.get("FAKE_SLEEP", "0")))
 if os.environ.get("FAKE_AGY_TOUCH"):  # 模拟总指挥同时在改原目录

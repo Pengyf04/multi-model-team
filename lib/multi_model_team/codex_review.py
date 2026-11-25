@@ -103,9 +103,10 @@ def reviewed_state(repo: Path, args, head: str | None = None) -> tuple[str | Non
         head = head or c.git_head(repo)
         if not head:
             return None, None
-        tree = gate_state.commit_tree(repo, head)
-        if tree != gate_state.worktree_tree(repo):
+        # 用 git status 判断工作区是否干净，不把未提交内容写进对象库
+        if c.git_status_entries(repo):
             return None, None
+        tree = gate_state.commit_tree(repo, head)
         if args.all:
             return tree, gate_state.EMPTY_BASE
         mb = c.git(repo, "merge-base", args.base, head, check=False).strip()
@@ -113,9 +114,15 @@ def reviewed_state(repo: Path, args, head: str | None = None) -> tuple[str | Non
     return gate_state.worktree_tree(repo), c.git_head(repo) or gate_state.EMPTY_BASE
 
 
-def build_prompt(previous: dict | None, scope: str) -> str:
+def build_prompt(previous: dict | None, scope: str, head: str | None = None) -> str:
     prompt = c.prompt_text("codex-review.md") + scope
     if previous:
+        prev_head = previous.get("reviewed_head")
+        if prev_head and head and prev_head != head:
+            prompt += (
+                f"\n上一轮审查的是提交 {prev_head}。此后新增的全部改动（`git diff {prev_head} {head}`）"
+                "都要完整审查，不只是针对上一轮问题的修复。\n"
+            )
         blocking = [f for f in previous.get("findings", []) if f.get("severity") == "blocking"]
         prompt += (
             "\n这是第二轮或之后的审查。上一轮的挡上线问题如下（JSON）：\n"
@@ -200,7 +207,11 @@ def main(argv: list[str] | None = None) -> int:
         return c.EXIT_USAGE
 
     max_rounds = int(section.get("max_rounds", 2))
-    run_dir = c.make_run_dir(cfg, "codex-review", args.run_dir, repo)
+    try:
+        run_dir = c.make_run_dir(cfg, "codex-review", args.run_dir, repo)
+    except c.UsageError as e:
+        print(f"codex-review：{e}")
+        return c.EXIT_USAGE
     base = {
         "tool": "codex-review",
         "repo": str(repo),
@@ -237,7 +248,7 @@ def main(argv: list[str] | None = None) -> int:
     deep = args.deep or bool(deep_hits)
     effort = section.get("deep_effort", "xhigh") if deep else section.get("effort", "high")
     model = args.model or section["model"]
-    prompt = build_prompt(previous, scope_text(args, files, head, commit_cmp))
+    prompt = build_prompt(previous, scope_text(args, files, head, commit_cmp), head)
     (run_dir / "prompt.md").write_text(prompt, encoding="utf-8")
 
     last_path = run_dir / "last-message.json"
@@ -295,6 +306,7 @@ def main(argv: list[str] | None = None) -> int:
         "findings": findings,
         "error": error,
         "reviewed_tree": tree_before,
+        "reviewed_head": head,
         "reviewed_base": reviewed_base,
         "pass_record": pass_record,
         "stderr_tail": stderr_tail if status in ("FAILED", "TIMEOUT") else "",

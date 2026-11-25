@@ -468,6 +468,25 @@ class ReviewSafetyTest(Base):
         self.run_bin("codex-review", str(self.repo), "--run-dir", str(reused))
         self.assertEqual(reused.stat().st_mode & 0o777, 0o700)
 
+    def test_foreign_run_dir_is_refused(self):
+        foreign = Path("/") if os.getuid() != 0 else None
+        if foreign is None:
+            self.skipTest("root 拥有所有目录")
+        (self.repo / "a.txt").write_text("changed\n")
+        code, _, res = self.run_bin("codex-review", str(self.repo), "--run-dir", str(foreign))
+        self.assertEqual(code, 2)
+        self.assertIn("不属于当前用户", res.stdout)
+        self.assertEqual(self.calls(), [])
+
+    def test_committed_mode_does_not_write_worktree_objects(self):
+        (self.repo / "secret.txt").write_text("local-only-secret-xyz\n")
+        blob = subprocess.run(
+            ["git", "hash-object", "secret.txt"], cwd=self.repo, capture_output=True, text=True
+        ).stdout.strip()
+        self.run_bin("codex-review", str(self.repo), "--all")
+        res = subprocess.run(["git", "cat-file", "-e", blob], cwd=self.repo, capture_output=True)
+        self.assertNotEqual(res.returncode, 0, "未提交的文件内容不应写进对象库")
+
 
 class IsolateSubmoduleTest(Base):
     def test_isolate_copies_checked_out_submodule(self):
@@ -482,3 +501,23 @@ class IsolateSubmoduleTest(Base):
         code, r, res = self.run_bin("agy-ask", str(self.repo), "问题", "--isolate")
         self.assertEqual(code, 0, res.stdout + res.stderr)
         self.assertFalse(Path(self.calls()[0]["cwd"]).exists(), "临时副本应被删除")
+
+    def test_isolate_skips_files_ignored_by_submodule(self):
+        sub = self.tmp / "sub2"
+        sub.mkdir()
+        (sub / "lib.txt").write_text("sub\n")
+        (sub / ".gitignore").write_text(".env\n")
+        git(sub, "init", "-q", "-b", "main")
+        git(sub, "add", ".")
+        git(sub, "commit", "-qm", "sub")
+        git(self.repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub), "vendor/sub")
+        git(self.repo, "commit", "-qm", "add submodule")
+        (self.repo / "vendor/sub/.env").write_text("TOKEN=secret\n")
+        (self.repo / "vendor/sub/new.txt").write_text("untracked ok\n")
+        env = {"FAKE_AGY_LIST": "1"}
+        code, r, res = self.run_bin("agy-ask", str(self.repo), "问题", "--isolate", env=env)
+        self.assertEqual(code, 0, res.stdout + res.stderr)
+        listed = self.calls()[0].get("files", [])
+        self.assertIn("vendor/sub/lib.txt", listed)
+        self.assertIn("vendor/sub/new.txt", listed)
+        self.assertNotIn("vendor/sub/.env", listed, "被子模块忽略的凭据文件不能进入副本")

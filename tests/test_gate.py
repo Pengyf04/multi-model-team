@@ -312,15 +312,46 @@ class GateTargetTest(GateBase):
         self.assertEqual(code, 0, out)
         self.assertEqual(len(self.review_calls()), 1)
 
-    def test_force_push_rewind_reviews_whole_repo(self):
+    def test_non_fast_forward_push_needs_human(self):
         self.push()
         self.commit("fix.txt")
         self.push()
-        git(self.repo, "reset", "-q", "--hard", "HEAD~1")
-        self.commit("other.txt")  # 与远端分叉：非快进，基准无法确认
+        fixed = self.remote_head()
+        git(self.repo, "reset", "-q", "--hard", "HEAD~1")  # 回退到首次推送、已有全量"已审"标记的提交
+        n = len(self.review_calls())
         code, out = self.push(PASS_JSON, None, "--force")
+        self.assertNotEqual(code, 0, "强推回退不能复用旧的已审标记放行")
+        self.assertIn("不是快进", out)
+        self.assertEqual(self.remote_head(), fixed)
+        self.assertEqual(len(self.review_calls()), n)
+        code, out = self.push(PASS_JSON, {"MULTI_MODEL_TEAM_ALLOW_PUSH": "确认回退"}, "--force")
         self.assertEqual(code, 0, out)
-        self.assertIn("整个仓库", self.review_calls()[-1]["stdin"])
+
+    def test_round_state_keys_do_not_collide(self):
+        self.push()
+        self.commit("c1.txt")
+        code, _ = self.raw_push("HEAD:refs/heads/release/api", env={"FAKE_REVIEW_JSON": BLOCKING})
+        self.assertNotEqual(code, 0)
+        code, out = self.raw_push("HEAD:refs/heads/release_api")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("第二轮", self.review_calls()[-1]["stdin"], "不同分支不能共用复审状态")
+        _, _, res = self.gate("status", str(self.repo))
+        self.assertIn("refs/heads/release/api", res.stdout)
+        self.assertEqual(self.gate("reset", str(self.repo), "--branch", "release/api")[0], 0)
+        _, _, res = self.gate("status", str(self.repo))
+        self.assertNotIn("被挡中", res.stdout)
+
+    def test_second_round_covers_all_changes_since_last_round(self):
+        self.push()
+        self.commit("c1.txt")
+        first = self.head()
+        self.push(review=BLOCKING)
+        self.commit("c2.txt")
+        code, out = self.push()
+        self.assertEqual(code, 0, out)
+        last = self.review_calls()[-1]["stdin"]
+        self.assertIn("第二轮", last)
+        self.assertIn(f"git diff {first} {self.head()}", last)
 
     def test_stale_tracking_ref_does_not_skip_review(self):
         self.push()

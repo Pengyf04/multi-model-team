@@ -66,26 +66,32 @@ def build_command(agy: str, prompt: str, model: str, timeout: int, resume: str |
     return cmd
 
 
+def copy_git_listed(src: Path, dst: Path, depth: int = 0) -> None:
+    """只复制 git 清单里的文件（已跟踪 + 未跟踪且未被忽略），被忽略的 .env 等不会进副本。
+    已检出的子模块在清单里只是一个目录：进入子模块，按它自己的清单和忽略规则递归复制。"""
+    out = subprocess.run(
+        ["git", "ls-files", "-co", "--exclude-standard", "-z"], cwd=src, capture_output=True, check=True
+    ).stdout.decode()
+    for rel in filter(None, out.split("\0")):
+        s = src / rel
+        if not s.exists() and not s.is_symlink():
+            continue
+        d = dst / rel
+        if s.is_dir() and not s.is_symlink():
+            if depth < 8 and (s / ".git").exists():
+                copy_git_listed(s, d, depth + 1)
+            continue  # 未检出或非仓库的目录条目：不复制
+        d.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(s, d, follow_symlinks=False)
+
+
 def copy_for_isolation(src: Path) -> tuple[Path, Path]:
     # resolve：macOS 的 /var 是 /private/var 的链接，统一成真实路径，回答里的路径才能准确换回原目录
     tmp_root = Path(tempfile.mkdtemp(prefix="agy-ask-")).resolve()
     dst = tmp_root / src.name
     try:
         if c.is_git_repo(src):
-            out = subprocess.run(
-                ["git", "ls-files", "-co", "--exclude-standard", "-z"], cwd=src, capture_output=True, check=True
-            ).stdout.decode()
-            for rel in filter(None, out.split("\0")):
-                s = src / rel
-                if not s.exists() and not s.is_symlink():
-                    continue
-                d = dst / rel
-                d.parent.mkdir(parents=True, exist_ok=True)
-                if s.is_dir() and not s.is_symlink():
-                    # 已检出的 git 子模块：ls-files 只列出目录本身，整体复制其内容（不含 .git 等）
-                    shutil.copytree(s, d, symlinks=True, ignore=shutil.ignore_patterns(*c._SKIP_DIRS))
-                else:
-                    shutil.copy2(s, d, follow_symlinks=False)
+            copy_git_listed(src, dst)
             dst.mkdir(parents=True, exist_ok=True)
         else:
             shutil.copytree(src, dst, symlinks=True, ignore=shutil.ignore_patterns(*c._SKIP_DIRS))
@@ -111,7 +117,11 @@ def main(argv: list[str] | None = None) -> int:
         return c.EXIT_USAGE
 
     model = args.model or section["model"]
-    run_dir = c.make_run_dir(cfg, "agy-ask", args.run_dir, target)
+    try:
+        run_dir = c.make_run_dir(cfg, "agy-ask", args.run_dir, target)
+    except c.UsageError as e:
+        print(f"agy-ask：{e}")
+        return c.EXIT_USAGE
     prompt = build_prompt(args.role, task, bool(args.resume))
     (run_dir / "prompt.md").write_text(prompt, encoding="utf-8")
 
