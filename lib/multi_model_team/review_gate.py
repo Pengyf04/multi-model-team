@@ -33,7 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
         sp = sub.add_parser(name, help=help_)
         sp.add_argument("repo", nargs="?", default=".")
         if name == "reset":
-            sp.add_argument("--branch", help="只清某个分支（默认全部）")
+            sp.add_argument("--branch", help="只清某个推送目标，如 origin:main（默认全部）")
     hk = sub.add_parser("hook", help="由 git pre-push 钩子调用，不需要手动运行")
     hk.add_argument("remote_name", nargs="?", default="origin")
     hk.add_argument("remote_url", nargs="?", default="")
@@ -102,7 +102,7 @@ def status(repo: Path) -> int:
     ]
     rounds_dir = gate_state.state_dir(repo) / "rounds"
     for p in sorted(rounds_dir.glob("*.json")) if rounds_dir.exists() else []:
-        lines.append(f"被挡中的分支：{p.stem}，已审 {json.loads(p.read_text())['round']} 轮")
+        lines.append(f"被挡中的推送目标：{p.stem}，已审 {json.loads(p.read_text())['round']} 轮")
     log = gate_state.state_dir(repo) / "gate.log"
     if log.exists():
         lines.append("最近记录：")
@@ -122,17 +122,50 @@ def object_exists(repo: Path, sha: str) -> bool:
     return subprocess.run(["git", "cat-file", "-e", f"{sha}^{{commit}}"], cwd=repo, capture_output=True).returncode == 0
 
 
+def is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
+    return (
+        subprocess.run(
+            ["git", "merge-base", "--is-ancestor", ancestor, descendant], cwd=repo, capture_output=True
+        ).returncode
+        == 0
+    )
+
+
+def remote_heads(repo: Path, remote: str) -> list[str] | None:
+    """向远程实际查询现有分支的提交；查不到（离线、无权限）返回 None。不用本地 refs/remotes，它可能已过期。"""
+    res = subprocess.run(
+        ["git", "ls-remote", "--heads", remote], cwd=repo, capture_output=True, text=True, stdin=subprocess.DEVNULL
+    )
+    if res.returncode != 0:
+        return None
+    return [line.split()[0] for line in res.stdout.splitlines() if line.strip()]
+
+
 def push_base(repo: Path, remote: str, remote_sha: str, local_sha: str) -> str | None:
-    """本次推送的审查起点；None 表示远程什么都没有，要审整个仓库。"""
-    if not is_zero(remote_sha) and object_exists(repo, remote_sha):
-        return remote_sha
-    refs = c.git(repo, "for-each-ref", "--format=%(refname)", f"refs/remotes/{remote}", check=False).split()
-    refs.sort(key=lambda r: (not r.endswith(("/HEAD", "/main", "/master")), r))
-    for ref in refs:
-        mb = c.git(repo, "merge-base", ref, local_sha, check=False).strip()
-        if mb:
-            return mb
-    return None
+    """本次推送的审查起点；None 表示要审整个仓库。
+
+    以 git 传给钩子的远端旧提交为准：
+    - 远端已有该分支且本次是快进：从远端旧提交审起；
+    - 非快进（强推回退、改写历史）或本地没有远端旧提交：基准无法确认，审整个仓库；
+    - 远端新建分支：向远程查询现有分支，取与本次推送最近的公共祖先；查不到就审整个仓库。"""
+    if not is_zero(remote_sha):
+        if object_exists(repo, remote_sha) and is_ancestor(repo, remote_sha, local_sha):
+            return remote_sha
+        return None
+    heads = remote_heads(repo, remote)
+    if not heads:
+        return None
+    best, best_depth = None, -1
+    for sha in heads:
+        if not object_exists(repo, sha):
+            continue
+        mb = c.git(repo, "merge-base", sha, local_sha, check=False).strip()
+        if not mb:
+            continue
+        depth = int(c.git(repo, "rev-list", "--count", mb).strip() or 0)
+        if depth > best_depth:
+            best, best_depth = mb, depth
+    return best
 
 
 def fail(msg: str) -> int:
@@ -163,6 +196,7 @@ def run_checks(repo: Path, cfg: dict) -> str | None:
 
 
 def review(repo: Path, branch: str, base: str | None) -> int:
+    """branch：轮次记录的键（远端 + 目标分支）。审查基准变了就从第 1 轮重新审。"""
     tree = gate_state.head_tree(repo)
     rec = gate_state.find_pass(repo, tree, base)
     if rec:
@@ -171,6 +205,10 @@ def review(repo: Path, branch: str, base: str | None) -> int:
         return c.EXIT_OK
 
     rounds = gate_state.load_rounds(repo, branch)
+    if rounds and rounds.get("base", "") != (base or ""):
+        print("  审查范围和上一轮不同，从第 1 轮重新审")
+        gate_state.clear_rounds(repo, branch)
+        rounds = None
     round_no = rounds["round"] + 1 if rounds else 1
     cmd = [str(c.ROOT / "bin" / "codex-review"), str(repo), "--json", "--round", str(round_no)]
     cmd += ["--base", base] if base else ["--all"]
@@ -197,7 +235,9 @@ def review(repo: Path, branch: str, base: str | None) -> int:
         return c.EXIT_OK
     if st == "BLOCKED":
         gate_state.save_rounds(
-            repo, branch, {"round": round_no, "result": str(Path(result["run_dir"]) / "result.json")}
+            repo,
+            branch,
+            {"round": round_no, "result": str(Path(result["run_dir"]) / "result.json"), "base": base or ""},
         )
         gate_state.log(repo, f"BLOCKED {branch} 第{round_no}轮 {result.get('run_dir')}")
         print(body)
@@ -228,15 +268,18 @@ def hook(args) -> int:
         print(f"⚠️ 已按放行指令跳过推送前检查。原因：{reason}")
         return c.EXIT_OK
 
-    updates = [u for u in updates if len(u) == 4 and u[0].startswith("refs/heads/") and not is_zero(u[1])]
+    # 每行是 <本地引用> <本地提交> <远端引用> <远端旧提交>。按远端目标判断：本地一侧可能是提交 SHA 或 HEAD。
+    updates = [u for u in updates if len(u) == 4 and u[2].startswith("refs/heads/") and not is_zero(u[1])]
     if not updates:
         return c.EXIT_OK  # 只推标签或删分支，不检查
 
     head = c.git_head(repo)
-    for local_ref, local_sha, _, _ in updates:
+    for local_ref, local_sha, remote_ref, _ in updates:
         if local_sha != head:
-            branch = local_ref.removeprefix("refs/heads/")
-            return fail(f"要推送的分支 {branch} 不是当前检出的提交，检查没法对上。请先 git switch {branch} 再推送")
+            target = remote_ref.removeprefix("refs/heads/")
+            return fail(
+                f"要推到 {target} 的提交（{local_ref}）不是当前检出的提交，检查没法对上。请先检出要推送的提交再推送"
+            )
     dirty = c.git_status_entries(repo)
     if dirty:
         return fail("有未提交的改动，检查的代码会和推送的不一致。请先提交或 git stash：\n  " + "\n  ".join(dirty[:10]))
@@ -261,12 +304,13 @@ def hook(args) -> int:
     else:
         print("[2/3] 守卫检查：未配置，跳过")
 
-    for local_ref, local_sha, _, remote_sha in updates:
-        base = push_base(repo, args.remote_name, remote_sha, local_sha)
+    for _, local_sha, remote_ref, remote_sha in updates:
+        remote = args.remote_url or args.remote_name
+        base = push_base(repo, remote, remote_sha, local_sha)
         if base == local_sha:
             print("[3/3] Codex 审查：没有新提交，跳过")
             continue
-        code = review(repo, local_ref.removeprefix("refs/heads/"), base)
+        code = review(repo, f"{args.remote_name}:{remote_ref.removeprefix('refs/heads/')}", base)
         if code != c.EXIT_OK:
             return code
     print("✓ 推送前关卡全部通过")

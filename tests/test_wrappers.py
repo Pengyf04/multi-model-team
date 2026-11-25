@@ -342,7 +342,7 @@ class CodexReviewTest(Base):
         git(self.repo, "commit", "-qm", "feat")
         _, r, _ = self.run_bin("codex-review", str(self.repo), "--base", "main")
         self.assertEqual(r["files"], ["pay.py"])
-        self.assertIn("git diff main...HEAD", self.calls()[0]["stdin"])
+        self.assertIn("git diff main...", self.calls()[0]["stdin"])
         self.assertNotIn("--base", self.calls()[0]["argv"])
         self.assertTrue(r["deep"])
 
@@ -408,3 +408,77 @@ class RunDirTest(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewSafetyTest(Base):
+    """codex-review 第 1 轮审查挡回问题的回归测试。"""
+
+    def test_stale_result_not_reused_when_codex_fails(self):
+        run_dir = self.tmp / "reused-run"
+        (self.repo / "a.txt").write_text("changed\n")
+        code, r, _ = self.run_bin("codex-review", str(self.repo), "--run-dir", str(run_dir))
+        self.assertEqual((code, r["status"]), (0, "PASS"))
+        (self.repo / "a.txt").write_text("changed again\n")
+        env = {"FAKE_REVIEW_EXIT": "1", "FAKE_REVIEW_NO_WRITE": "1"}
+        code, r, _ = self.run_bin("codex-review", str(self.repo), "--run-dir", str(run_dir), env=env)
+        self.assertEqual((code, r["status"]), (1, "FAILED"))
+        self.assertIsNone(r["pass_record"])
+
+    def test_nonzero_exit_is_not_pass_even_with_output(self):
+        (self.repo / "a.txt").write_text("changed\n")
+        code, r, _ = self.run_bin("codex-review", str(self.repo), env={"FAKE_REVIEW_EXIT": "2"})
+        self.assertEqual((code, r["status"]), (1, "FAILED"))
+        self.assertIsNone(r["pass_record"])
+
+    def test_all_with_staged_deletion_lists_head_and_leaves_no_stamp(self):
+        git(self.repo, "rm", "-q", "a.txt")
+        code, r, _ = self.run_bin("codex-review", str(self.repo), "--all")
+        self.assertEqual(code, 0)
+        self.assertIn("a.txt", r["files"])
+        self.assertIsNone(r["pass_record"], "工作区与 HEAD 不一致时不登记已审")
+
+    def test_all_clean_leaves_stamp(self):
+        code, r, _ = self.run_bin("codex-review", str(self.repo), "--all")
+        self.assertEqual(code, 0)
+        self.assertTrue(r["pass_record"])
+
+    def test_merge_commit_is_reviewed_against_first_parent(self):
+        git(self.repo, "switch", "-q", "-c", "side")
+        (self.repo / "side.txt").write_text("side\n")
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-qm", "side")
+        git(self.repo, "switch", "-q", "main")
+        (self.repo / "main.txt").write_text("main\n")
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-qm", "main")
+        git(self.repo, "merge", "-q", "--no-ff", "-m", "merge", "side")
+        code, r, _ = self.run_bin("codex-review", str(self.repo), "--commit", "HEAD")
+        self.assertEqual(code, 0)
+        self.assertEqual(r["files"], ["side.txt"])
+        self.assertEqual(len(self.calls()), 1, "合并提交必须交给 Codex 审查")
+        self.assertIn("第一父提交", self.calls()[0]["stdin"])
+
+    def test_run_dir_is_private(self):
+        (self.repo / "a.txt").write_text("changed\n")
+        _, r, _ = self.run_bin("codex-review", str(self.repo))
+        self.assertEqual(Path(r["run_dir"]).stat().st_mode & 0o777, 0o700)
+        reused = self.tmp / "shared-run"
+        reused.mkdir(mode=0o755)
+        reused.chmod(0o755)
+        self.run_bin("codex-review", str(self.repo), "--run-dir", str(reused))
+        self.assertEqual(reused.stat().st_mode & 0o777, 0o700)
+
+
+class IsolateSubmoduleTest(Base):
+    def test_isolate_copies_checked_out_submodule(self):
+        sub = self.tmp / "sub"
+        sub.mkdir()
+        (sub / "lib.txt").write_text("sub\n")
+        git(sub, "init", "-q", "-b", "main")
+        git(sub, "add", ".")
+        git(sub, "commit", "-qm", "sub")
+        git(self.repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub), "vendor/sub")
+        git(self.repo, "commit", "-qm", "add submodule")
+        code, r, res = self.run_bin("agy-ask", str(self.repo), "问题", "--isolate")
+        self.assertEqual(code, 0, res.stdout + res.stderr)
+        self.assertFalse(Path(self.calls()[0]["cwd"]).exists(), "临时副本应被删除")

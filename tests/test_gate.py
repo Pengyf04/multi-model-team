@@ -1,6 +1,7 @@
 """guard-check 与 review-gate 的测试：守卫欠账规则、钩子安装、推到本地模拟远程仓库的各种情形。"""
 
 import json
+import shutil
 import subprocess
 import unittest
 from pathlib import Path
@@ -178,7 +179,7 @@ class GatePushTest(GateBase):
         self.assertIn("金额算错", out)
         self.assertEqual(self.remote_head(), pushed, "被挡时远程不应更新")
         base_sha = pushed
-        self.assertIn(f"git diff {base_sha}...HEAD", self.review_calls()[-1]["stdin"])
+        self.assertIn(f"git diff {base_sha}...", self.review_calls()[-1]["stdin"])
 
         self.commit("fix.txt")
         code, out = self.push()
@@ -280,6 +281,73 @@ class GatePushTest(GateBase):
             ["git", "push", "-q", "origin", "v1"], cwd=self.repo, env=self.env, capture_output=True, text=True
         )
         self.assertEqual(res.returncode, 0, res.stderr)
+
+
+class GateTargetTest(GateBase):
+    """review-gate 第 1 轮审查挡回问题的回归测试。"""
+
+    def head(self):
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo, capture_output=True, text=True
+        ).stdout.strip()
+
+    def raw_push(self, *refspec, env=None):
+        res = subprocess.run(
+            ["git", "push", "-q", "origin", *refspec],
+            cwd=self.repo,
+            env={**self.env, "FAKE_REVIEW_JSON": PASS_JSON, **(env or {})},
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        return res.returncode, res.stdout + res.stderr
+
+    def test_push_by_sha_is_checked(self):
+        (self.repo / "a.txt").write_text("dirty\n")
+        code, out = self.raw_push(f"{self.head()}:refs/heads/main")
+        self.assertNotEqual(code, 0, "用提交 SHA 推送也必须经过关卡")
+        self.assertIn("未提交的改动", out)
+        (self.repo / "a.txt").write_text("hello\n")
+        code, out = self.raw_push(f"{self.head()}:refs/heads/main")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(len(self.review_calls()), 1)
+
+    def test_force_push_rewind_reviews_whole_repo(self):
+        self.push()
+        self.commit("fix.txt")
+        self.push()
+        git(self.repo, "reset", "-q", "--hard", "HEAD~1")
+        self.commit("other.txt")  # 与远端分叉：非快进，基准无法确认
+        code, out = self.push(PASS_JSON, None, "--force")
+        self.assertEqual(code, 0, out)
+        self.assertIn("整个仓库", self.review_calls()[-1]["stdin"])
+
+    def test_stale_tracking_ref_does_not_skip_review(self):
+        self.push()
+        n = len(self.review_calls())
+        empty = self.tmp / "empty.git"
+        subprocess.run(["git", "init", "-q", "--bare", str(empty)], check=True)
+        git(self.repo, "remote", "set-url", "origin", str(empty))
+        shutil.rmtree(self.repo / ".git/multi-model-team/review-pass")  # 排除"已审"标记的影响
+        code, out = self.push()
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("没有新提交", out)
+        self.assertEqual(len(self.review_calls()), n + 1)
+        self.assertIn("整个仓库", self.review_calls()[-1]["stdin"])
+
+    def test_rounds_bound_to_target_and_base(self):
+        init = self.head()
+        self.raw_push(f"{init}:refs/heads/old")
+        self.commit("c1.txt")
+        self.push()
+        self.commit("c2.txt")
+        code, _ = self.push(review=BLOCKING)
+        self.assertNotEqual(code, 0)
+        code, out = self.raw_push("HEAD:refs/heads/old")
+        self.assertEqual(code, 0, out)
+        last = self.review_calls()[-1]["stdin"]
+        self.assertNotIn("第二轮", last, "换了推送目标和范围，应从第 1 轮全面审查")
+        self.assertIn(f"git diff {init}...", last)
 
 
 if __name__ == "__main__":

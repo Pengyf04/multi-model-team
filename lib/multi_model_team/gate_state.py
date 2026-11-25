@@ -1,7 +1,7 @@
 """推送前关卡的本地状态：放在 <git 公共目录>/multi-model-team/，不进仓库。
 
 - review-pass/<tree>.json：这份代码（以 git tree 标识）审查通过的记录，含审查范围的起点 base。
-- rounds/<分支>.json：当前分支被挡的轮数和上一轮结果，供下次推送做第二轮复审。
+- rounds/<远端>_<目标分支>.json：该推送目标被挡的轮数、上一轮结果和审查基准；基准变了就从第 1 轮重审。
 - gate.log：每次放行、拦截的记录。
 """
 
@@ -30,6 +30,11 @@ def state_dir(repo: Path) -> Path:
 
 def head_tree(repo: Path) -> str | None:
     res = subprocess.run(["git", "rev-parse", "HEAD^{tree}"], cwd=repo, capture_output=True, text=True)
+    return res.stdout.strip() if res.returncode == 0 else None
+
+
+def commit_tree(repo: Path, commit: str) -> str | None:
+    res = subprocess.run(["git", "rev-parse", f"{commit}^{{tree}}"], cwd=repo, capture_output=True, text=True)
     return res.stdout.strip() if res.returncode == 0 else None
 
 

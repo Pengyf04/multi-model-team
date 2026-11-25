@@ -92,7 +92,11 @@ def make_run_dir(cfg: dict, kind: str, run_dir: str | None, target: Path) -> Pat
     else:
         stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
         path = Path(cfg["paths"]["runs_root"]) / f"{project_name(target)}-{stamp}-{kind}-{os.getpid()}"
-    path.mkdir(parents=True, exist_ok=True)
+    # 记录里有任务描述、命令输出和源码 diff：目录只允许本人访问，别的本机用户进不来。
+    # 复用已有目录（--run-dir）时也收紧权限；不属于当前用户的目录改不了，交给后续写入报错。
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if path.stat().st_uid == os.getuid():
+        path.chmod(0o700)
     return path
 
 

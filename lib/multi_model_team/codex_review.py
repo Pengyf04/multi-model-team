@@ -32,13 +32,31 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def changed_files(repo: Path, args) -> list[str]:
+def first_parent(repo: Path, commit: str) -> str | None:
+    """提交的第一父提交；根提交返回 None。合并提交按相对第一父提交的差异审查。"""
+    out = c.git(repo, "rev-list", "--parents", "-n", "1", commit).split()
+    return out[1] if len(out) > 1 else None
+
+
+def commit_range(repo: Path, commit: str) -> tuple[str | None, str]:
+    """--commit 模式的比较口径：(第一父提交或 None, 提交本身的完整 SHA)。"""
+    sha = c.git(repo, "rev-parse", "--verify", f"{commit}^{{commit}}").strip()
+    return first_parent(repo, sha), sha
+
+
+def changed_files(repo: Path, args, head: str | None = None) -> list[str]:
+    """head：本轮固定下来的 HEAD 提交，审查和登记"已审"都以这同一个快照为准。"""
+    head = head or "HEAD"
     if args.base:
-        out = c.git(repo, "diff", "--name-only", f"{args.base}...HEAD")
+        out = c.git(repo, "diff", "--name-only", f"{args.base}...{head}")
     elif args.commit:
-        out = c.git(repo, "diff-tree", "--no-commit-id", "--name-only", "-r", "--root", args.commit)
+        parent, sha = commit_range(repo, args.commit)
+        if parent:
+            out = c.git(repo, "diff", "--name-only", parent, sha)
+        else:
+            out = c.git(repo, "diff-tree", "--no-commit-id", "--name-only", "-r", "--root", sha)
     elif args.all:
-        out = c.git(repo, "ls-files")
+        out = c.git(repo, "ls-tree", "-r", "--name-only", head)
     else:
         out = "\n".join(line[3:].split(" -> ")[-1] for line in c.git_status_entries(repo))
     return [x for x in out.splitlines() if x.strip()]
@@ -49,29 +67,49 @@ def needs_deep(files: list[str], keywords: list[str]) -> list[str]:
     return [f for f in files if any(k in f.lower() for k in kws)]
 
 
-def scope_text(args, files: list[str]) -> str:
+def scope_text(args, files: list[str], head: str | None = None, commit_cmp: tuple | None = None) -> str:
     """审查范围写进要求里，由 Codex 自己用 git 查看。"""
+    head = head or "HEAD"
     if args.base:
-        how = f"当前分支相对 {args.base} 的改动。用 `git diff {args.base}...HEAD` 查看。"
+        how = (
+            f"提交 {head} 相对 {args.base} 的改动。用 `git diff {args.base}...{head}` 查看；"
+            f"文件内容以该提交为准（`git show {head}:<路径>`）。"
+        )
     elif args.commit:
-        how = f"提交 {args.commit} 引入的改动。用 `git show {args.commit}` 查看。"
+        parent, sha = commit_cmp or (None, args.commit)
+        if parent:
+            how = f"提交 {sha} 相对其第一父提交的改动（合并提交也按此口径）。用 `git diff {parent} {sha}` 查看。"
+        else:
+            how = f"根提交 {sha} 引入的全部内容。用 `git show {sha}` 查看。"
     elif args.all:
-        how = "整个仓库当前提交的全部代码（首次推送，没有可比较的基准）。逐个阅读下面列出的文件。"
+        how = (
+            f"整个仓库在提交 {head} 的全部代码（首次推送，没有可比较的基准）。"
+            f"逐个阅读下面列出的文件，以该提交的内容为准（`git show {head}:<路径>`），不要看工作区里未提交的改动。"
+        )
     else:
         how = "工作区里所有未提交的改动（已暂存、未暂存、未跟踪）。用 `git diff HEAD` 查看，未跟踪的文件直接阅读。"
     listing = "\n".join(f"- {f}" for f in files)
     return f"\n## 审查范围\n\n{how}\n\n涉及的文件：\n{listing}\n"
 
 
-def reviewed_state(repo: Path, args) -> tuple[str | None, str | None]:
-    """返回 (被审代码的 tree, 审查范围起点)。--commit 模式不留"已审"标记。"""
+def reviewed_state(repo: Path, args, head: str | None = None) -> tuple[str | None, str | None]:
+    """返回 (被审代码的 tree, 审查范围起点)。--commit 模式不留"已审"标记。
+
+    --all / --base 审的是提交 head 的快照；只有工作区与该快照完全一致（没有任何未提交改动）时才登记，
+    否则"已审"标记可能被套到审查时 Codex 实际没看到的代码上。"""
     if args.commit:
         return None, None
-    if args.all:
-        return gate_state.head_tree(repo), gate_state.EMPTY_BASE
-    if args.base:
-        mb = c.git(repo, "merge-base", args.base, "HEAD", check=False).strip()
-        return gate_state.head_tree(repo), mb or None
+    if args.all or args.base:
+        head = head or c.git_head(repo)
+        if not head:
+            return None, None
+        tree = gate_state.commit_tree(repo, head)
+        if tree != gate_state.worktree_tree(repo):
+            return None, None
+        if args.all:
+            return tree, gate_state.EMPTY_BASE
+        mb = c.git(repo, "merge-base", args.base, head, check=False).strip()
+        return tree, mb or None
     return gate_state.worktree_tree(repo), c.git_head(repo) or gate_state.EMPTY_BASE
 
 
@@ -181,8 +219,10 @@ def main(argv: list[str] | None = None) -> int:
         c.emit(f"# codex-review 结果：ESCALATE\n\n- ⚠️ {result['error']}\n- 记录目录：{run_dir}", result, args.json)
         return c.EXIT_ESCALATE
 
+    head = c.git_head(repo)
     try:
-        files = changed_files(repo, args)
+        commit_cmp = commit_range(repo, args.commit) if args.commit else None
+        files = changed_files(repo, args, head)
     except RuntimeError as e:
         print(f"codex-review：{e}")
         return c.EXIT_USAGE
@@ -192,15 +232,17 @@ def main(argv: list[str] | None = None) -> int:
         c.emit(f"# codex-review 结果：PASS\n\n- 没有需要审查的改动\n- 记录目录：{run_dir}", result, args.json)
         return c.EXIT_OK
 
-    tree_before, reviewed_base = reviewed_state(repo, args)
+    tree_before, reviewed_base = reviewed_state(repo, args, head)
     deep_hits = needs_deep(files, section.get("deep_path_keywords", []))
     deep = args.deep or bool(deep_hits)
     effort = section.get("deep_effort", "xhigh") if deep else section.get("effort", "high")
     model = args.model or section["model"]
-    prompt = build_prompt(previous, scope_text(args, files))
+    prompt = build_prompt(previous, scope_text(args, files, head, commit_cmp))
     (run_dir / "prompt.md").write_text(prompt, encoding="utf-8")
 
     last_path = run_dir / "last-message.json"
+    # 复用记录目录时，旧的结论文件不能被当成本轮结果
+    last_path.unlink(missing_ok=True)
     cmd = build_command(cfg["paths"]["codex"], model, effort, c.ROOT / "schemas" / "review.schema.json", last_path)
     run = c.run_logged(
         cmd,
@@ -215,10 +257,13 @@ def main(argv: list[str] | None = None) -> int:
     if run.timed_out:
         status, code, error = "TIMEOUT", c.EXIT_TIMEOUT, f"超过 {timeout} 秒未结束，已终止"
     else:
-        try:
-            data = parse_review(last_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as e:
-            error = f"无法解析审查结果：{e}；codex 退出码 {run.returncode}"
+        if run.returncode != 0:
+            error = f"codex 异常退出（退出码 {run.returncode}），本轮结果不采信"
+        else:
+            try:
+                data = parse_review(last_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as e:
+                error = f"无法解析审查结果：{e}；codex 退出码 {run.returncode}"
         if data is None:
             status, code = "FAILED", c.EXIT_FAILED
         elif any(f["severity"] == "blocking" for f in data["findings"]):
@@ -228,8 +273,8 @@ def main(argv: list[str] | None = None) -> int:
 
     pass_record, stamp_note = None, None
     if status == "PASS" and tree_before and reviewed_base:
-        tree_after, _ = reviewed_state(repo, args)
-        if tree_after == tree_before:
+        tree_after, _ = reviewed_state(repo, args, head)
+        if tree_after == tree_before and c.git_head(repo) == head:
             pass_record = str(gate_state.record_pass(repo, tree_before, reviewed_base, str(run_dir / "result.json")))
         else:
             stamp_note = "审查期间代码有变化，未留下已审标记，推送时会重新审查"
