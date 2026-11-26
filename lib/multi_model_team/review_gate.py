@@ -103,7 +103,8 @@ def status(repo: Path) -> int:
     rounds_dir = gate_state.state_dir(repo) / "rounds"
     for p in sorted(rounds_dir.glob("*.json")) if rounds_dir.exists() else []:
         data = json.loads(p.read_text())
-        lines.append(f"被挡中的推送目标：{data.get('target', p.stem)}，已审 {data['round']} 轮")
+        url, _, ref = str(data.get("target", p.stem)).partition(" ")
+        lines.append(f"被挡中的推送目标：{c.redact_url(url)} {ref}".rstrip() + f"，已审 {data['round']} 轮")
     log = gate_state.state_dir(repo) / "gate.log"
     if log.exists():
         lines.append("最近记录：")
@@ -205,9 +206,19 @@ def run_checks(repo: Path, cfg: dict) -> str | None:
     return None
 
 
-def review(repo: Path, branch: str, base: str | None) -> int:
-    """branch：轮次记录的键（远端 + 目标分支）。审查基准变了就从第 1 轮重新审。"""
-    tree = gate_state.head_tree(repo)
+def snapshot_changed(repo: Path, local_sha: str) -> str | None:
+    """检查过程中有人切了分支或改了文件：检查的代码就不是要推送的那份了。"""
+    if c.git_head(repo) != local_sha:
+        return "检查期间当前检出的提交变了，检查的代码和要推送的不一致。请重新推送"
+    if c.git_status_entries(repo):
+        return "检查期间工作区出现了未提交的改动，检查的代码和要推送的不一致。请提交或 git stash 后重新推送"
+    return None
+
+
+def review(repo: Path, branch: str, base: str | None, local_sha: str) -> int:
+    """branch：轮次记录的键（远端 + 目标分支）。审查基准变了就从第 1 轮重新审。
+    local_sha：git 实际要推送的提交，缓存查询和审查都以它为准。"""
+    tree = gate_state.commit_tree(repo, local_sha)
     rec = gate_state.find_pass(repo, tree, base)
     if rec:
         print(f"[3/3] Codex 审查：这份代码 {rec['time']} 已审查通过，不重复审")
@@ -221,6 +232,7 @@ def review(repo: Path, branch: str, base: str | None) -> int:
         rounds = None
     round_no = rounds["round"] + 1 if rounds else 1
     cmd = [str(c.ROOT / "bin" / "codex-review"), str(repo), "--json", "--round", str(round_no)]
+    cmd += ["--expect-head", local_sha]
     cmd += ["--base", base] if base else ["--all"]
     if rounds:
         cmd += ["--previous", rounds["result"]]
@@ -232,6 +244,11 @@ def review(repo: Path, branch: str, base: str | None) -> int:
         print(res.stdout[-2000:], res.stderr[-2000:])
         gate_state.log(repo, f"FAILED {branch} 审查输出无法解析")
         return fail(f"审查没能完成。可稍后重试，或者{ALLOW_HINT}")
+
+    changed = snapshot_changed(repo, local_sha)
+    if changed:
+        gate_state.log(repo, f"SNAPSHOT_CHANGED {branch}")
+        return fail(changed)
 
     st = result.get("status")
     review_md = Path(result.get("run_dir", "")) / "review.md"
@@ -315,12 +332,16 @@ def hook(args) -> int:
         print("[2/3] 守卫检查：未配置，跳过")
 
     remote = args.remote_url or args.remote_name
+    shown = c.redact_url(remote)  # 写进日志、状态文件和终端的远端地址：去掉其中的令牌
     for _, local_sha, remote_ref, remote_sha in updates:
+        changed = snapshot_changed(repo, local_sha)
+        if changed:
+            return fail(changed)
         if not is_zero(remote_sha) and not (
             object_exists(repo, remote_sha) and is_ancestor(repo, remote_sha, local_sha)
         ):
             target = remote_ref.removeprefix("refs/heads/")
-            gate_state.log(repo, f"NON_FF {remote} {remote_ref}")
+            gate_state.log(repo, f"NON_FF {shown} {remote_ref}")
             return fail(
                 f"推送到 {target} 不是快进（强推/改写历史，或本地没有远端最新提交）。"
                 "这类更新可能撤掉远端已有的修复，关卡无法判断，需要你来决定：\n"
@@ -330,7 +351,7 @@ def hook(args) -> int:
         if base == local_sha:
             print("[3/3] Codex 审查：没有新提交，跳过")
             continue
-        code = review(repo, f"{remote} {remote_ref}", base)
+        code = review(repo, f"{shown} {remote_ref}", base, local_sha)
         if code != c.EXIT_OK:
             return code
     print("✓ 推送前关卡全部通过")

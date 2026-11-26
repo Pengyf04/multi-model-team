@@ -11,9 +11,11 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -25,6 +27,8 @@ EXIT_WORKSPACE_MODIFIED = 3
 EXIT_ESCALATE = 4
 EXIT_BLOCKING = 5
 EXIT_TIMEOUT = 124
+
+EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"  # git 的空 tree
 
 
 class UsageError(Exception):
@@ -156,6 +160,34 @@ def git(cwd: Path, *args: str, check: bool = True) -> str:
     if check and res.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} 失败：{res.stderr.strip()}")
     return res.stdout
+
+
+def redact_url(url: str) -> str:
+    """去掉远端地址里的用户名和密码（令牌），用于日志、状态文件和终端显示。"""
+    parts = urlsplit(url)
+    if parts.scheme and "@" in parts.netloc:
+        host = parts.netloc.rsplit("@", 1)[1]
+        return urlunsplit((parts.scheme, host, parts.path, parts.query, parts.fragment))
+    return url
+
+
+def git_diff_all(path: Path, base: str | None) -> str:
+    """工作区相对 base 的完整差异，包括未跟踪（未被忽略）的新文件；用临时索引，不动真正的暂存区。"""
+    index = Path(git(path, "rev-parse", "--path-format=absolute", "--git-path", "index").strip())
+    with tempfile.TemporaryDirectory() as d:
+        tmp_index = Path(d) / "index"
+        if index.exists():
+            shutil.copy(index, tmp_index)
+        env = {**os.environ, "GIT_INDEX_FILE": str(tmp_index)}
+        subprocess.run(["git", "add", "-A"], cwd=path, env=env, check=True, capture_output=True)
+        res = subprocess.run(
+            ["git", "diff", "--cached", "--binary", base or EMPTY_TREE],
+            cwd=path,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        return res.stdout
 
 
 def is_git_repo(path: Path) -> bool:

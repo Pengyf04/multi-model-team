@@ -29,11 +29,6 @@ def state_dir(repo: Path) -> Path:
     return d
 
 
-def head_tree(repo: Path) -> str | None:
-    res = subprocess.run(["git", "rev-parse", "HEAD^{tree}"], cwd=repo, capture_output=True, text=True)
-    return res.stdout.strip() if res.returncode == 0 else None
-
-
 def commit_tree(repo: Path, commit: str) -> str | None:
     res = subprocess.run(["git", "rev-parse", f"{commit}^{{tree}}"], cwd=repo, capture_output=True, text=True)
     return res.stdout.strip() if res.returncode == 0 else None
@@ -65,22 +60,26 @@ def record_pass(repo: Path, tree: str, base: str, result_file: str) -> Path:
 
 
 def find_pass(repo: Path, tree: str, push_base: str | None) -> dict | None:
-    """这份代码审过且审查范围覆盖本次推送（审查起点不晚于推送起点）时返回记录。"""
+    """这份代码审过、且审查范围正好覆盖本次推送时返回记录。
+
+    全量审查记录覆盖任何推送；差异审查记录只在审查起点与推送起点是同一提交时复用。
+    只凭"审查起点是推送起点的祖先"不够：中间可能有提交修复后又被回退，净差异里看不到。"""
     path = state_dir(repo) / "review-pass" / f"{tree}.json"
     if not path.exists():
         return None
     rec = json.loads(path.read_text(encoding="utf-8"))
     if rec["base"] == EMPTY_BASE:
         return rec
-    if push_base is None:  # 本次要审整个仓库，而记录只审了一部分
-        return None
-    ok = (
-        subprocess.run(
-            ["git", "merge-base", "--is-ancestor", rec["base"], push_base], cwd=repo, capture_output=True
-        ).returncode
-        == 0
-    )
-    return rec if ok else None
+    return rec if push_base is not None and rec["base"] == push_base else None
+
+
+def revoke_pass(repo: Path, tree: str) -> bool:
+    """同一份代码后来被判定有挡上线问题：撤销它的审查通过记录，推送时不能再复用。"""
+    path = state_dir(repo) / "review-pass" / f"{tree}.json"
+    if path.exists():
+        path.unlink()
+        return True
+    return False
 
 
 def _branch_file(repo: Path, branch: str) -> Path:

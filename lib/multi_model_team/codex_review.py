@@ -25,6 +25,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--round", type=int, default=1, help="第几轮审查（默认 1）")
     p.add_argument("--previous", metavar="RESULT_JSON", help="上一轮的 result.json，第二轮起传入")
     p.add_argument("--deep", action="store_true", help="强制深审档位")
+    p.add_argument("--expect-head", metavar="SHA", help="当前检出的必须是这个提交，否则不审（推送关卡用）")
     p.add_argument("--model", help="覆盖配置里的模型名")
     p.add_argument("--timeout", help="超时，如 30m（默认取配置）")
     p.add_argument("--run-dir", help="本次调用记录的存放目录（默认建在 runs_root 下）")
@@ -114,21 +115,28 @@ def reviewed_state(repo: Path, args, head: str | None = None) -> tuple[str | Non
     return gate_state.worktree_tree(repo), c.git_head(repo) or gate_state.EMPTY_BASE
 
 
-def build_prompt(previous: dict | None, scope: str, head: str | None = None) -> str:
+def build_prompt(previous: dict | None, scope: str, head: str | None = None, tree: str | None = None) -> str:
+    """tree：本轮被审代码的 tree。和上一轮的 tree 一比，就知道两轮之间新增了哪些改动。"""
     prompt = c.prompt_text("codex-review.md") + scope
     if previous:
-        prev_head = previous.get("reviewed_head")
+        prev_head, prev_tree = previous.get("reviewed_head"), previous.get("reviewed_tree")
         if prev_head and head and prev_head != head:
             prompt += (
                 f"\n上一轮审查的是提交 {prev_head}。此后新增的全部改动（`git diff {prev_head} {head}`）"
                 "都要完整审查，不只是针对上一轮问题的修复。\n"
             )
+        if prev_tree and tree and prev_tree != tree:
+            prompt += (
+                f"\n上一轮审查的代码快照是 tree {prev_tree}，本轮是 tree {tree}。"
+                f"两者之间的全部改动（`git diff {prev_tree} {tree}`）都要完整审查，不只是针对上一轮问题的修复。\n"
+            )
         blocking = [f for f in previous.get("findings", []) if f.get("severity") == "blocking"]
         prompt += (
             "\n这是第二轮或之后的审查。上一轮的挡上线问题如下（JSON）：\n"
             + json.dumps(blocking, ensure_ascii=False, indent=2)
-            + "\n本轮只检查：1) 这些问题是否已修好；2) 修复过程中是否引入了新的挡上线问题。"
-            "不要再提上一轮问题的延伸情况，其余发现一律记为 advisory。\n"
+            + "\n本轮检查：1) 这些问题是否已修好；"
+            "2) 两轮之间新增的改动（含修复）里有没有挡上线问题，有就照常记为 blocking。"
+            "不要再提上一轮问题本身的延伸情况，那类发现记为 advisory。\n"
         )
     return prompt
 
@@ -231,6 +239,9 @@ def main(argv: list[str] | None = None) -> int:
         return c.EXIT_ESCALATE
 
     head = c.git_head(repo)
+    if args.expect_head and head != args.expect_head:
+        print(f"codex-review：当前检出的是 {head}，不是要审的 {args.expect_head}，不审")
+        return c.EXIT_USAGE
     try:
         commit_cmp = commit_range(repo, args.commit) if args.commit else None
         files = changed_files(repo, args, head)
@@ -248,7 +259,7 @@ def main(argv: list[str] | None = None) -> int:
     deep = args.deep or bool(deep_hits)
     effort = section.get("deep_effort", "xhigh") if deep else section.get("effort", "high")
     model = args.model or section["model"]
-    prompt = build_prompt(previous, scope_text(args, files, head, commit_cmp), head)
+    prompt = build_prompt(previous, scope_text(args, files, head, commit_cmp), head, tree_before)
     (run_dir / "prompt.md").write_text(prompt, encoding="utf-8")
 
     last_path = run_dir / "last-message.json"
@@ -283,7 +294,13 @@ def main(argv: list[str] | None = None) -> int:
             status, code = "PASS", c.EXIT_OK
 
     pass_record, stamp_note = None, None
-    if status == "PASS" and tree_before and reviewed_base:
+    if status == "BLOCKED" and tree_before:
+        gate_state.revoke_pass(repo, tree_before)  # 同一份代码早先的通过记录作废
+    # 复审时要能和上一轮快照比对，才能确认两轮之间的改动都审到了；比不了就不留可复用的"已审"标记
+    comparable = not previous or bool(previous.get("reviewed_tree"))
+    if status == "PASS" and tree_before and reviewed_base and not comparable:
+        stamp_note = "上一轮没有记录代码快照，本轮可能没覆盖全部改动，未留下已审标记"
+    elif status == "PASS" and tree_before and reviewed_base:
         tree_after, _ = reviewed_state(repo, args, head)
         if tree_after == tree_before and c.git_head(repo) == head:
             pass_record = str(gate_state.record_pass(repo, tree_before, reviewed_base, str(run_dir / "result.json")))

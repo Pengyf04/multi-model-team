@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -66,9 +67,21 @@ def build_command(agy: str, prompt: str, model: str, timeout: int, resume: str |
     return cmd
 
 
-def copy_git_listed(src: Path, dst: Path, depth: int = 0) -> None:
+def _inside(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def copy_git_listed(src: Path, dst: Path, depth: int = 0, root: Path | None = None) -> None:
     """只复制 git 清单里的文件（已跟踪 + 未跟踪且未被忽略），被忽略的 .env 等不会进副本。
-    已检出的子模块在清单里只是一个目录：进入子模块，按它自己的清单和忽略规则递归复制。"""
+    已检出的子模块在清单里只是一个目录：进入子模块，按它自己的清单和忽略规则递归复制。
+
+    清单里的路径可能经过指向仓库外的符号链接目录（索引还记着原路径）：这类路径一律跳过；
+    末级是符号链接时，只保留指向仓库内的链接，免得副本里留下通往仓库外的入口。"""
+    root = root or src.resolve()
     out = subprocess.run(
         ["git", "ls-files", "-co", "--exclude-standard", "-z"], cwd=src, capture_output=True, check=True
     ).stdout.decode()
@@ -76,13 +89,27 @@ def copy_git_listed(src: Path, dst: Path, depth: int = 0) -> None:
         s = src / rel
         if not s.exists() and not s.is_symlink():
             continue
+        if not _inside(s.parent.resolve(), root):
+            continue  # 上级目录经过符号链接通到了仓库外
+        if s.is_symlink() and not _inside(s.resolve(), root):
+            continue  # 指向仓库外的链接
         d = dst / rel
         if s.is_dir() and not s.is_symlink():
             if depth < 8 and (s / ".git").exists():
-                copy_git_listed(s, d, depth + 1)
+                copy_git_listed(s, d, depth + 1, root)
             continue  # 未检出或非仓库的目录条目：不复制
         d.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(s, d, follow_symlinks=False)
+
+
+def drop_outside_links(src: Path, dst: Path) -> None:
+    """删掉副本里指向原目录以外的符号链接。"""
+    root = src.resolve()
+    for dirpath, dirnames, filenames in os.walk(dst):
+        for name in dirnames + filenames:
+            d = Path(dirpath) / name
+            if d.is_symlink() and not _inside((src / d.relative_to(dst)).resolve(), root):
+                d.unlink()
 
 
 def copy_for_isolation(src: Path) -> tuple[Path, Path]:
@@ -95,6 +122,7 @@ def copy_for_isolation(src: Path) -> tuple[Path, Path]:
             dst.mkdir(parents=True, exist_ok=True)
         else:
             shutil.copytree(src, dst, symlinks=True, ignore=shutil.ignore_patterns(*c._SKIP_DIRS))
+            drop_outside_links(src, dst)
     except BaseException:
         shutil.rmtree(tmp_root, ignore_errors=True)
         raise

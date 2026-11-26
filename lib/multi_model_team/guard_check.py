@@ -96,10 +96,15 @@ def scan(repo: Path, guards: list[Guard], baseline: dict) -> Report:
                 text = (repo / rel).read_text(encoding="utf-8", errors="ignore")
             except OSError:
                 continue
-            lines = [(n, line.strip()) for n, line in enumerate(text.splitlines(), 1) if g.regex.search(line)]
-            if lines:
-                rep.counts[g.name][rel] = len(lines)
-                rep.hits[(g.name, rel)] = lines
+            # 欠账按实际匹配次数计：同一行再加一处违规也算新增
+            hits = [
+                (n, line.strip(), k)
+                for n, line in enumerate(text.splitlines(), 1)
+                if (k := sum(1 for _ in g.regex.finditer(line)))
+            ]
+            if hits:
+                rep.counts[g.name][rel] = sum(h[2] for h in hits)
+                rep.hits[(g.name, rel)] = [(n, line) for n, line, _ in hits]
         if g.name not in baseline:
             if rep.counts[g.name]:
                 rep.unregistered.append(g.name)
