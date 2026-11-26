@@ -79,7 +79,7 @@ tests/      假 CLI（fake_codex / fake_agy）+ 单元测试
 2. 能改结构让错误写法写不出来的，改结构；
 3. 都做不到，才写进项目文档的文字规则，并写明原因。
 
-守卫规则写在 `.multi-model-team/project.toml` 的 `[[guards]]`；已有违规记成欠账（`guard-baseline.json`），欠账只许减少，新增违规一律报错。`--update-baseline` 只能登记新规则的欠账或下调已有欠账，不能调高。
+守卫规则写在 `.multi-model-team/project.toml` 的 `[[guards]]`；已有违规记成欠账（`guard-baseline.json`），欠账只许减少，新增违规一律报错。欠账按正则的实际匹配次数计（同一行多一处违规也算新增）；旧版按行计的欠账文件按原口径兼容，`--update-baseline` 时换算。`--update-baseline` 只能登记新规则的欠账或下调已有欠账，不能调高。
 
 ## 测试
 

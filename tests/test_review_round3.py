@@ -199,6 +199,98 @@ class GuardSameLineTest(Base):
         self.assertEqual(r["new_violations"][0]["file"], "a.ts")
 
 
+class Round2FollowupTest(GateBase):
+    """第 2 轮复审挡回问题的回归测试。"""
+
+    def test_worker_diff_handles_non_utf8_and_keeps_object_store_clean(self):
+        before = set(
+            subprocess.run(["git", "count-objects", "-v"], cwd=self.repo, capture_output=True, text=True).stdout.split()
+        )
+        code, r, res = self.run_bin("codex-worker", str(self.repo), "任务", env={"FAKE_CODEX_WRITE_LATIN1": "data.csv"})
+        self.assertEqual(code, 0, res.stdout + res.stderr)
+        self.assertIn("caf\xe9".encode("latin-1"), Path(r["diff_file"]).read_bytes())
+        blob = subprocess.run(
+            ["git", "hash-object", "data.csv"], cwd=self.repo, capture_output=True, text=True
+        ).stdout.strip()
+        exists = subprocess.run(["git", "cat-file", "-e", blob], cwd=self.repo, capture_output=True).returncode == 0
+        self.assertFalse(exists, "新文件的内容不能写进仓库共享的对象库")
+        after = set(
+            subprocess.run(["git", "count-objects", "-v"], cwd=self.repo, capture_output=True, text=True).stdout.split()
+        )
+        self.assertEqual(before, after)
+
+    def test_legacy_line_based_baseline_not_misjudged(self):
+        d = self.repo / ".multi-model-team"
+        d.mkdir()
+        (d / "project.toml").write_text(
+            '[[guards]]\nname = "no-float"\npattern = \'parseFloat\\(\'\nfiles = ["*.ts"]\nmessage = "用 toCents()"\n'
+        )
+        (self.repo / "a.ts").write_text("parseFloat(x) + parseFloat(y)\n")
+        (d / "guard-baseline.json").write_text(json.dumps({"guards": {"no-float": {"a.ts": 1}}}))  # 旧版：按行计
+        self.assertEqual(self.run_bin("guard-check", str(self.repo))[0], 0, "升级后没改代码不能被判新增")
+        code, _, _ = self.run_bin("guard-check", str(self.repo), "--update-baseline")
+        self.assertEqual(code, 0)
+        data = json.loads((d / "guard-baseline.json").read_text())
+        self.assertEqual(data, {"count": "matches", "guards": {"no-float": {"a.ts": 2}}})
+        (self.repo / "a.ts").write_text("parseFloat(x) + parseFloat(y) + parseFloat(z)\n")
+        self.assertEqual(self.run_bin("guard-check", str(self.repo))[0], 1, "换算后同一行新增违规照样拦")
+
+    def test_worktree_remove_protects_ignored_files(self):
+        (self.repo / ".gitignore").write_text("*.db\nnode_modules/\n")
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-qm", "ignore")
+        code, r, _ = self.run_bin("codex-worktree", "create", str(self.repo), "w1")
+        self.assertEqual(code, 0)
+        wt = Path(r["path"])
+        (wt / "node_modules").mkdir()
+        (wt / "node_modules/x.js").write_text("dep\n")
+        code, _, _ = self.run_bin("codex-worktree", "remove", str(self.repo), "w1")
+        self.assertEqual(code, 0, "依赖目录能重装，不挡删除")
+        code, r, _ = self.run_bin("codex-worktree", "create", str(self.repo), "w2")
+        wt = Path(r["path"])
+        (wt / "dev.db").write_text("data\n")
+        code, _, res = self.run_bin("codex-worktree", "remove", str(self.repo), "w2")
+        self.assertEqual(code, 2)
+        self.assertIn("dev.db", res.stdout)
+        self.assertTrue((wt / "dev.db").exists())
+        self.assertEqual(self.run_bin("codex-worktree", "remove", str(self.repo), "w2", "--force")[0], 0)
+        self.assertFalse(wt.exists())
+
+    def test_isolate_survives_symlink_loop_and_drops_absolute_links(self):
+        (self.repo / "loop1").symlink_to("loop2")
+        (self.repo / "loop2").symlink_to("loop1")
+        (self.repo / ".gitignore").write_text(".env\n")
+        (self.repo / ".env").write_text("TOKEN=x\n")
+        (self.repo / "abs_env").symlink_to(self.repo / ".env")
+        (self.repo / "rel.txt").symlink_to("a.txt")
+        code, _, res = self.run_bin("agy-ask", str(self.repo), "问题", "--isolate", env={"FAKE_AGY_LIST": "1"})
+        self.assertEqual(code, 0, res.stdout + res.stderr)
+        files = self.calls()[-1]["files"]
+        self.assertIn("a.txt", files)
+        self.assertIn("rel.txt", files)
+        # 循环链接是否保留随 Python 版本不同（3.11 解析时报错→跳过），两种都安全；关键是不崩溃、不外泄
+        self.assertFalse({"abs_env", ".env"} & set(files))
+
+    def test_commit_mode_block_revokes_pass(self):
+        self.commit("c1.txt")
+        _, r, _ = self.run_bin("codex-review", str(self.repo), "--all", env={"FAKE_REVIEW_JSON": PASS_JSON})
+        self.assertTrue(Path(r["pass_record"]).exists())
+        code, _, _ = self.run_bin(
+            "codex-review", str(self.repo), "--commit", "HEAD", "--deep", env={"FAKE_REVIEW_JSON": BLOCKING}
+        )
+        self.assertEqual(code, 5)
+        self.assertFalse(Path(r["pass_record"]).exists(), "单提交深审判阻断后，旧的通过记录要作废")
+
+    def test_unresolvable_link_treated_as_outside(self):
+        """Python 3.11 解析循环链接会抛 RuntimeError：当作仓库外的链接跳过，不让隔离模式崩溃。"""
+        from unittest import mock
+
+        from multi_model_team import agy_ask
+
+        with mock.patch.object(Path, "resolve", side_effect=RuntimeError("Symlink loop")):
+            self.assertFalse(agy_ask._inside(Path("/x/loop"), Path("/x")))
+
+
 if __name__ == "__main__":
     os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
     unittest.main()

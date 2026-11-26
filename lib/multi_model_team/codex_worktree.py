@@ -46,6 +46,20 @@ def worktree_path(root: Path, name: str) -> Path:
     return root.parent / f"{root.name}.worktrees" / name
 
 
+def ignored_files(path: Path) -> list[str]:
+    """工作台里被 git 忽略、删工作台时会一起丢掉的文件。依赖和缓存目录（node_modules、.venv 等）能重装，不算。"""
+    out = c.git(path, "status", "--porcelain=v1", "--ignored=matching", "--untracked-files=normal")
+    found = []
+    for line in out.splitlines():
+        if not line.startswith("!! "):
+            continue
+        rel = line[3:]
+        if rel.rstrip("/").split("/")[0] in c._SKIP_DIRS:
+            continue
+        found.append(rel)
+    return found
+
+
 def list_worktrees(root: Path) -> list[dict]:
     items, cur = [], {}
     for line in c.git(root, "worktree", "list", "--porcelain").splitlines() + [""]:
@@ -108,6 +122,13 @@ def main(argv: list[str] | None = None) -> int:
         return c.EXIT_USAGE
     if not args.force and c.git_status_entries(path):
         print("codex-worktree：工作台里还有未提交的改动，确认不要了再加 --force")
+        return c.EXIT_USAGE
+    ignored = ignored_files(path)
+    if not args.force and ignored:
+        print(
+            "codex-worktree：工作台里有被 git 忽略的文件，删除后无法从 git 恢复，确认不要了再加 --force：\n  "
+            + "\n  ".join(ignored[:10])
+        )
         return c.EXIT_USAGE
     try:
         c.git(root, "worktree", "remove", *(["--force"] if args.force else []), str(path))

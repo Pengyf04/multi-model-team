@@ -127,7 +127,7 @@ def main(argv: list[str] | None = None) -> int:
     head_after = c.git_head(wt)
     changes = c.git_status_entries(wt)
     diff = c.git_diff_all(wt, head_before)  # 含 Codex 新建但没暂存的文件
-    (run_dir / "diff.patch").write_text(diff, encoding="utf-8")
+    (run_dir / "diff.patch").write_bytes(diff)  # 按原始字节保存：新文件可能不是 UTF-8
     final = (
         last_path.read_text(encoding="utf-8") if last_path.exists() else (ev["messages"][-1] if ev["messages"] else "")
     )

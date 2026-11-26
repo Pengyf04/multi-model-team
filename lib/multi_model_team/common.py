@@ -171,21 +171,28 @@ def redact_url(url: str) -> str:
     return url
 
 
-def git_diff_all(path: Path, base: str | None) -> str:
-    """工作区相对 base 的完整差异，包括未跟踪（未被忽略）的新文件；用临时索引，不动真正的暂存区。"""
+def git_diff_all(path: Path, base: str | None) -> bytes:
+    """工作区相对 base 的完整差异（原始字节），包括未跟踪（未被忽略）的新文件。
+
+    用临时索引和临时对象目录：不动真正的暂存区，新文件的内容也不会写进仓库共享的对象库，
+    现有对象库只作为读取来源。"""
     index = Path(git(path, "rev-parse", "--path-format=absolute", "--git-path", "index").strip())
+    objects = git(path, "rev-parse", "--path-format=absolute", "--git-path", "objects").strip()
     with tempfile.TemporaryDirectory() as d:
-        tmp_index = Path(d) / "index"
+        tmp_index, tmp_objects = Path(d) / "index", Path(d) / "objects"
+        tmp_objects.mkdir()
         if index.exists():
             shutil.copy(index, tmp_index)
-        env = {**os.environ, "GIT_INDEX_FILE": str(tmp_index)}
+        alternates = os.pathsep.join(x for x in (objects, os.environ.get("GIT_ALTERNATE_OBJECT_DIRECTORIES")) if x)
+        env = {
+            **os.environ,
+            "GIT_INDEX_FILE": str(tmp_index),
+            "GIT_OBJECT_DIRECTORY": str(tmp_objects),
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": alternates,
+        }
         subprocess.run(["git", "add", "-A"], cwd=path, env=env, check=True, capture_output=True)
         res = subprocess.run(
-            ["git", "diff", "--cached", "--binary", base or EMPTY_TREE],
-            cwd=path,
-            env=env,
-            capture_output=True,
-            text=True,
+            ["git", "diff", "--cached", "--binary", base or EMPTY_TREE], cwd=path, env=env, capture_output=True
         )
         return res.stdout
 

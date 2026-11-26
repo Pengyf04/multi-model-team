@@ -294,8 +294,9 @@ def main(argv: list[str] | None = None) -> int:
             status, code = "PASS", c.EXIT_OK
 
     pass_record, stamp_note = None, None
-    if status == "BLOCKED" and tree_before:
-        gate_state.revoke_pass(repo, tree_before)  # 同一份代码早先的通过记录作废
+    blocked_tree = gate_state.commit_tree(repo, commit_cmp[1]) if commit_cmp else tree_before
+    if status == "BLOCKED" and blocked_tree:
+        gate_state.revoke_pass(repo, blocked_tree)  # 同一份代码早先的通过记录作废（--commit 模式也算）
     # 复审时要能和上一轮快照比对，才能确认两轮之间的改动都审到了；比不了就不留可复用的"已审"标记
     comparable = not previous or bool(previous.get("reviewed_tree"))
     if status == "PASS" and tree_before and reviewed_base and not comparable:

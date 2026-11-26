@@ -26,6 +26,9 @@ if "--output-schema" in argv:  # codex-review 的调用
 if os.environ.get("FAKE_CODEX_WRITE"):
     with open(os.environ["FAKE_CODEX_WRITE"], "w") as f:
         f.write("new\n")
+if os.environ.get("FAKE_CODEX_WRITE_LATIN1"):  # 不是 UTF-8 的文本文件
+    with open(os.environ["FAKE_CODEX_WRITE_LATIN1"], "wb") as f:
+        f.write("café,1\n".encode("latin-1"))
 if os.environ.get("FAKE_CODEX_COMMIT"):
     subprocess.run(["git", "add", "-A"], check=True)
     subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "codex"], check=True)

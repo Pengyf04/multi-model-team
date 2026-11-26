@@ -68,10 +68,11 @@ def build_command(agy: str, prompt: str, model: str, timeout: int, resume: str |
 
 
 def _inside(path: Path, root: Path) -> bool:
+    """path 解析后是否在 root 里；循环链接等无法解析的路径一律当作不在。"""
     try:
-        path.relative_to(root)
+        path.resolve().relative_to(root)
         return True
-    except ValueError:
+    except (ValueError, RuntimeError, OSError):
         return False
 
 
@@ -89,10 +90,10 @@ def copy_git_listed(src: Path, dst: Path, depth: int = 0, root: Path | None = No
         s = src / rel
         if not s.exists() and not s.is_symlink():
             continue
-        if not _inside(s.parent.resolve(), root):
+        if not _inside(s.parent, root):
             continue  # 上级目录经过符号链接通到了仓库外
-        if s.is_symlink() and not _inside(s.resolve(), root):
-            continue  # 指向仓库外的链接
+        if s.is_symlink() and (os.path.isabs(os.readlink(s)) or not _inside(s, root)):
+            continue  # 绝对链接（副本里仍指回原目录）或指向仓库外的链接
         d = dst / rel
         if s.is_dir() and not s.is_symlink():
             if depth < 8 and (s / ".git").exists():
@@ -103,12 +104,12 @@ def copy_git_listed(src: Path, dst: Path, depth: int = 0, root: Path | None = No
 
 
 def drop_outside_links(src: Path, dst: Path) -> None:
-    """删掉副本里指向原目录以外的符号链接。"""
+    """删掉副本里的绝对链接（会指回原目录）和指向原目录以外的链接。"""
     root = src.resolve()
     for dirpath, dirnames, filenames in os.walk(dst):
         for name in dirnames + filenames:
             d = Path(dirpath) / name
-            if d.is_symlink() and not _inside((src / d.relative_to(dst)).resolve(), root):
+            if d.is_symlink() and (os.path.isabs(os.readlink(d)) or not _inside(src / d.relative_to(dst), root)):
                 d.unlink()
 
 

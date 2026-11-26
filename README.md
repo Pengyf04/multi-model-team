@@ -69,7 +69,7 @@ skill 只在手动输入时运行，不会被自动触发。流程：
 | 命令 | 作用 |
 |---|---|
 | `agy-ask [--role plan\|copywriting\|ask] [--isolate] [--resume ID] <目录> -` | 以只读顾问身份调用 Gemini。用单次生效的 deny 规则加沙箱禁止写入，调用前后比对目录指纹，被改动则退出码 3。`--isolate` 在临时副本里运行。 |
-| `codex-worktree create\|list\|remove <仓库> <名字>` | 给 Codex 建独立工作台：`<仓库名>.worktrees/<名字>`，分支 `codex/<名字>`。 |
+| `codex-worktree create\|list\|remove <仓库> <名字>` | 给 Codex 建独立工作台：`<仓库名>.worktrees/<名字>`，分支 `codex/<名字>`。删除时若有未提交改动或被忽略的本地文件（依赖、缓存除外）会拒绝，确认不要再加 `--force`。 |
 | `codex-worker [--resume ID] [--allow-dirty] <工作台> -` | 让 Codex 在工作台里干活：只能写该工作台、不能联网。交回改动文件、**实际执行过的命令及退出码**、diff，以及标注"未经核实"的 Codex 汇报。 |
 | `codex-review [--uncommitted\|--base 分支\|--commit SHA\|--all] [--round N --previous 上轮result.json] [--deep] <仓库>` | 用 Codex 做只读、结构化的代码审查。退出码：0 可上线；5 有挡上线问题；4 超过轮数交人决定；1 失败；124 超时。改动路径涉及钱、权限、对外消息时自动用深审档位。 |
 | `review-gate install\|uninstall\|status\|reset <仓库>` | 给仓库装推送前关卡（git pre-push 钩子）。 |

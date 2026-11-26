@@ -27,7 +27,8 @@ class Guard:
 
 @dataclass
 class Report:
-    counts: dict = field(default_factory=dict)  # 规则 -> 文件 -> 次数
+    counts: dict = field(default_factory=dict)  # 规则 -> 文件 -> 匹配次数
+    line_counts: dict = field(default_factory=dict)  # 规则 -> 文件 -> 命中行数（旧版欠账的口径）
     hits: dict = field(default_factory=dict)  # (规则, 文件) -> [(行号, 内容)]
     new_violations: list = field(default_factory=list)  # 超出欠账的
     reducible: list = field(default_factory=list)  # 欠账可以下调的
@@ -84,11 +85,16 @@ def list_files(repo: Path) -> list[str]:
     )
 
 
-def scan(repo: Path, guards: list[Guard], baseline: dict) -> Report:
+COUNT_UNIT = "matches"  # 欠账文件的计数口径；旧版文件没有这个字段，按命中行数计
+
+
+def scan(repo: Path, guards: list[Guard], baseline: dict, legacy: bool = False) -> Report:
+    """legacy：欠账文件是旧版按行计的，比较时也按行计，免得升级后没改代码却被判新增。"""
     rep = Report()
     files = list_files(repo)
     for g in guards:
         rep.counts[g.name] = {}
+        rep.line_counts[g.name] = {}
         for rel in files:
             if not g.applies(rel):
                 continue
@@ -104,14 +110,16 @@ def scan(repo: Path, guards: list[Guard], baseline: dict) -> Report:
             ]
             if hits:
                 rep.counts[g.name][rel] = sum(h[2] for h in hits)
+                rep.line_counts[g.name][rel] = len(hits)
                 rep.hits[(g.name, rel)] = [(n, line) for n, line, _ in hits]
         if g.name not in baseline:
             if rep.counts[g.name]:
                 rep.unregistered.append(g.name)
             continue
         allowed = baseline[g.name]
-        for rel in sorted(set(rep.counts[g.name]) | set(allowed)):
-            now, debt = rep.counts[g.name].get(rel, 0), allowed.get(rel, 0)
+        current = rep.line_counts[g.name] if legacy else rep.counts[g.name]
+        for rel in sorted(set(current) | set(allowed)):
+            now, debt = current.get(rel, 0), allowed.get(rel, 0)
             if now > debt:
                 rep.new_violations.append((g, rel, now, debt))
             elif now < debt:
@@ -125,7 +133,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         guards = load_guards(project.load(repo))
         bpath = project.baseline_path(repo)
-        baseline = json.loads(bpath.read_text(encoding="utf-8")).get("guards", {}) if bpath.exists() else {}
+        data = json.loads(bpath.read_text(encoding="utf-8")) if bpath.exists() else {}
+        baseline = data.get("guards", {})
+        legacy = bool(baseline) and data.get("count") != COUNT_UNIT
     except (project.ProjectConfigError, json.JSONDecodeError) as e:
         print(f"guard-check：{e}")
         return c.EXIT_USAGE
@@ -134,7 +144,7 @@ def main(argv: list[str] | None = None) -> int:
         c.emit("guard-check：项目没有配置守卫规则，跳过", {"status": "NO_GUARDS"}, args.json)
         return c.EXIT_OK
 
-    rep = scan(repo, guards, baseline)
+    rep = scan(repo, guards, baseline, legacy)
     # 新规则还没登记欠账：在 --update-baseline 前，现有违规一律算新违规
     for name in rep.unregistered:
         g = next(x for x in guards if x.name == name)
@@ -152,11 +162,12 @@ def main(argv: list[str] | None = None) -> int:
             new_baseline = {}
             for g in guards:
                 counts = rep.counts[g.name]
-                if g.name in baseline:
+                if g.name in baseline and not legacy:
                     counts = {f: min(n, baseline[g.name].get(f, 0)) for f, n in counts.items()}
+                # 旧版欠账：上面已按行确认没有新增，这里直接换算成当前的匹配次数
                 new_baseline[g.name] = {f: n for f, n in sorted(counts.items()) if n > 0}
             bpath.parent.mkdir(parents=True, exist_ok=True)
-            c.write_json(bpath, {"guards": new_baseline})
+            c.write_json(bpath, {"count": COUNT_UNIT, "guards": new_baseline})
             total = sum(sum(v.values()) for v in new_baseline.values())
             lines.append(f"✓ 欠账已更新：{bpath}（共 {total} 处）")
             for name in rep.unregistered:
